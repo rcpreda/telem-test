@@ -1,6 +1,6 @@
 /**
  * Teltonika Codec 8 / Codec 8 Extended decoder
- * Works directly with raw Buffer from device (no hex conversion)
+ * Strict implementation according to Teltonika protocol specification
  */
 
 class Codec8Decoder {
@@ -10,6 +10,7 @@ class Codec8Decoder {
         }
         this.data = buffer;
         this.offset = 0;
+        this.isExtended = false;
     }
 
     readBytes(n) {
@@ -76,11 +77,14 @@ class Codec8Decoder {
             avlRecords: []
         };
 
-        if (result.codecId !== 0x08 && result.codecId !== 0x8e) {
+        // Determine codec type
+        if (result.codecId === 0x08) {
+            this.isExtended = false;
+        } else if (result.codecId === 0x8e) {
+            this.isExtended = true;
+        } else {
             throw new Error(`Unsupported codec: 0x${result.codecId.toString(16)}`);
         }
-
-        this.isExtended = result.codecId === 0x8e;
 
         for (let i = 0; i < result.numberOfData1; i++) {
             const record = this.decodeAVLRecord();
@@ -107,8 +111,8 @@ class Codec8Decoder {
             speed: this.readUInt16()
         };
 
-        // IO Element
-        const io = this.decodeIOElement();
+        // IO Element - completely different for Codec 8 vs 8E
+        const io = this.isExtended ? this.decodeIOElementExtended() : this.decodeIOElementStandard();
 
         return {
             timestamp: new Date(Number(timestamp)).toISOString(),
@@ -119,78 +123,185 @@ class Codec8Decoder {
         };
     }
 
-    decodeIOElement() {
-        // Codec 8 Extended uses 2-byte IDs and counts, Codec 8 uses 1-byte
-        const eventId = this.isExtended ? this.readUInt16() : this.readUInt8();
-        const totalElements = this.isExtended ? this.readUInt16() : this.readUInt8();
+    /**
+     * Codec 8 Standard IO Element
+     * - All IDs are 1 byte
+     * - All counts are 1 byte
+     */
+    decodeIOElementStandard() {
+        const eventIoId = this.readUInt8();
+        const totalCount = this.readUInt8();
 
         const io = {
-            eventId,
-            totalElements,
-            elements: {}
+            eventIoId,
+            totalCount,
+            elements: []
         };
 
-        // 1-byte IO elements
-        const count1 = this.isExtended ? this.readUInt16() : this.readUInt8();
-        for (let i = 0; i < count1; i++) {
-            const id = this.isExtended ? this.readUInt16() : this.readUInt8();
-            const value = this.readUInt8();
-            io.elements[id] = { size: 1, value, raw: Buffer.from([value]), name: this.getIOName(id) };
+        // 1-byte values
+        const n1 = this.readUInt8();
+        for (let i = 0; i < n1; i++) {
+            const id = this.readUInt8();
+            const raw = this.readBytes(1);
+            io.elements.push({
+                id,
+                size: 1,
+                value: raw.readUInt8(0),
+                raw,
+                name: this.getIOName(id)
+            });
         }
 
-        // 2-byte IO elements
-        const count2 = this.isExtended ? this.readUInt16() : this.readUInt8();
-        for (let i = 0; i < count2; i++) {
-            const id = this.isExtended ? this.readUInt16() : this.readUInt8();
+        // 2-byte values
+        const n2 = this.readUInt8();
+        for (let i = 0; i < n2; i++) {
+            const id = this.readUInt8();
             const raw = this.readBytes(2);
-            const value = raw.readUInt16BE(0);
-            io.elements[id] = { size: 2, value, raw, name: this.getIOName(id) };
+            io.elements.push({
+                id,
+                size: 2,
+                value: raw.readUInt16BE(0),
+                raw,
+                name: this.getIOName(id)
+            });
         }
 
-        // 4-byte IO elements
-        const count4 = this.isExtended ? this.readUInt16() : this.readUInt8();
-        for (let i = 0; i < count4; i++) {
-            const id = this.isExtended ? this.readUInt16() : this.readUInt8();
+        // 4-byte values
+        const n4 = this.readUInt8();
+        for (let i = 0; i < n4; i++) {
+            const id = this.readUInt8();
             const raw = this.readBytes(4);
-            const value = raw.readUInt32BE(0);
-            io.elements[id] = { size: 4, value, raw, name: this.getIOName(id) };
+            io.elements.push({
+                id,
+                size: 4,
+                value: raw.readUInt32BE(0),
+                raw,
+                name: this.getIOName(id)
+            });
         }
 
-        // 8-byte IO elements
-        const count8 = this.isExtended ? this.readUInt16() : this.readUInt8();
-        for (let i = 0; i < count8; i++) {
-            const id = this.isExtended ? this.readUInt16() : this.readUInt8();
+        // 8-byte values
+        const n8 = this.readUInt8();
+        for (let i = 0; i < n8; i++) {
+            const id = this.readUInt8();
             const raw = this.readBytes(8);
             const high = raw.readUInt32BE(0);
             const low = raw.readUInt32BE(4);
-            const value = BigInt(high) * BigInt(0x100000000) + BigInt(low);
-            io.elements[id] = { size: 8, value: value.toString(), raw, name: this.getIOName(id) };
+            io.elements.push({
+                id,
+                size: 8,
+                value: (BigInt(high) * BigInt(0x100000000) + BigInt(low)).toString(),
+                raw,
+                name: this.getIOName(id)
+            });
         }
 
-        // Codec 8 Extended has variable-length (NX) IO elements
-        if (this.isExtended) {
-            const countNX = this.readUInt16();
-            for (let i = 0; i < countNX; i++) {
-                const id = this.readUInt16();
-                const length = this.readUInt16();
-                const raw = this.readBytes(length);
+        return io;
+    }
 
-                let value;
-                // Decode VIN and other ASCII fields
-                if (id === 256 || id === 385) {
-                    value = raw.toString('ascii').replace(/\0/g, '');
-                } else {
-                    value = raw.toString('hex');
-                }
+    /**
+     * Codec 8 Extended IO Element
+     * - All IDs are 2 bytes
+     * - All counts are 2 bytes
+     * - Has NX variable-length elements
+     */
+    decodeIOElementExtended() {
+        const eventIoId = this.readUInt16();
+        const totalCount = this.readUInt16();
 
-                io.elements[id] = { size: length, value, raw, name: this.getIOName(id) };
+        const io = {
+            eventIoId,
+            totalCount,
+            elements: []
+        };
+
+        // N1: 1-byte values
+        const n1 = this.readUInt16();
+        for (let i = 0; i < n1; i++) {
+            const id = this.readUInt16();
+            const raw = this.readBytes(1);
+            io.elements.push({
+                id,
+                size: 1,
+                value: raw.readUInt8(0),
+                raw,
+                name: this.getIOName(id)
+            });
+        }
+
+        // N2: 2-byte values
+        const n2 = this.readUInt16();
+        for (let i = 0; i < n2; i++) {
+            const id = this.readUInt16();
+            const raw = this.readBytes(2);
+            io.elements.push({
+                id,
+                size: 2,
+                value: raw.readUInt16BE(0),
+                raw,
+                name: this.getIOName(id)
+            });
+        }
+
+        // N4: 4-byte values
+        const n4 = this.readUInt16();
+        for (let i = 0; i < n4; i++) {
+            const id = this.readUInt16();
+            const raw = this.readBytes(4);
+            io.elements.push({
+                id,
+                size: 4,
+                value: raw.readUInt32BE(0),
+                raw,
+                name: this.getIOName(id)
+            });
+        }
+
+        // N8: 8-byte values
+        const n8 = this.readUInt16();
+        for (let i = 0; i < n8; i++) {
+            const id = this.readUInt16();
+            const raw = this.readBytes(8);
+            const high = raw.readUInt32BE(0);
+            const low = raw.readUInt32BE(4);
+            io.elements.push({
+                id,
+                size: 8,
+                value: (BigInt(high) * BigInt(0x100000000) + BigInt(low)).toString(),
+                raw,
+                name: this.getIOName(id)
+            });
+        }
+
+        // NX: Variable-length values (Codec 8E only)
+        const nx = this.readUInt16();
+        for (let i = 0; i < nx; i++) {
+            const id = this.readUInt16();
+            const length = this.readUInt16();
+            const raw = this.readBytes(length);
+
+            let value;
+            // ASCII decode for known string fields
+            if (id === 256 || id === 281 || id === 385) {
+                value = raw.toString('ascii').replace(/\0/g, '');
+            } else {
+                value = raw.toString('hex');
             }
+
+            io.elements.push({
+                id,
+                size: length,
+                value,
+                raw,
+                name: this.getIOName(id)
+            });
         }
 
         return io;
     }
 
     getIOName(id) {
+        // FMC003 OBD Tracker IO Elements
         const ioNames = {
             1: 'Digital Input 1',
             2: 'Digital Input 2',
@@ -200,10 +311,10 @@ class Codec8Decoder {
             6: 'Digital Output 2',
             9: 'Analog Input 1',
             10: 'Analog Input 2',
-            11: 'ICCID1',
-            12: 'ICCID2',
-            13: 'ICCID3',
-            14: 'ICCID4',
+            11: 'ICCID',
+            12: 'Fuel Used GPS',
+            13: 'Fuel Rate GPS',
+            14: 'Average Fuel Use',
             15: 'Eco Score',
             16: 'Total Odometer',
             17: 'Axis X',
@@ -213,46 +324,14 @@ class Codec8Decoder {
             24: 'Speed',
             25: 'External Voltage',
             26: 'Internal Battery Voltage',
-            27: 'GNSS PDOP',
-            28: 'GNSS HDOP',
-            31: 'GNSS Status',
-            32: 'GNSS Fix Mode',
-            33: 'GNSS Age',
-            35: 'Crash Event',
-            36: 'Over Speeding',
-            37: 'Harsh Acceleration',
-            38: 'Harsh Braking',
-            39: 'Harsh Cornering',
-            40: 'Unplug',
-            41: 'Crash Event Trace',
-            42: 'GNSS VDOP',
-            43: 'GNSS TDOP',
-            44: 'GNSS Position Accuracy',
-            45: 'GNSS Speed Accuracy',
-            46: 'GNSS Age',
-            66: 'External Voltage',
-            67: 'Battery Voltage',
-            68: 'Battery Current',
+            30: 'Number of DTC',
+            66: 'External Voltage (mV)',
+            67: 'Battery Voltage (mV)',
+            68: 'Battery Current (mA)',
             69: 'GNSS Status',
-            72: 'Dallas Temperature 1',
-            73: 'Dallas Temperature 2',
-            74: 'Dallas Temperature 3',
-            75: 'Dallas Temperature 4',
-            78: 'Driver ID (iButton)',
             80: 'Data Mode',
-            81: 'Vehicle Speed',
-            82: 'Accelerator Pedal',
-            83: 'Fuel Consumed',
-            84: 'Fuel Level',
-            85: 'Engine RPM',
-            87: 'Total Mileage',
-            89: 'Fuel Level %',
-            90: 'Fuel Type',
-            110: 'Fuel Rate',
-            113: 'Battery Level',
+            113: 'Battery Level %',
             175: 'Auto Geofence',
-            179: 'Digital Output 1',
-            180: 'Digital Output 2',
             181: 'GNSS PDOP',
             182: 'GNSS HDOP',
             199: 'Trip Odometer',
@@ -262,10 +341,10 @@ class Codec8Decoder {
             236: 'Alarm',
             237: 'Network Type',
             238: 'Operator Code',
-            239: 'IMEI',
+            239: 'Ignition',
             240: 'Movement',
-            241: 'Active GSM Operator',
-            243: 'Green Driving Status',
+            241: 'GSM Operator',
+            243: 'Green Driving Type',
             246: 'Towing Detection',
             247: 'Crash Detection',
             249: 'Jamming Detection',
@@ -277,20 +356,12 @@ class Codec8Decoder {
             255: 'Geofence Zone',
             256: 'VIN',
             281: 'DOUT 3',
-            282: 'DOUT 4',
-            283: 'DIN 4',
-            284: 'DIN 5',
             303: 'Instant Movement',
-            327: 'UL202-02 Sensor Fuel level',
-            328: 'UL202-02 Sensor Fuel temp',
-            329: 'UL202-02 Sensor Status',
-            380: 'Digital Output 3',
-            381: 'Ground Sense',
-            385: 'Beacon ID',
-            389: 'OBD OEM Total Mileage',
-            390: 'OBD OEM Fuel Level',
+            385: 'Beacon',
+            389: 'OBD Total Mileage',
+            390: 'OBD Fuel Level',
         };
-        return ioNames[id] || `Unknown (${id})`;
+        return ioNames[id] || `IO_${id}`;
     }
 }
 

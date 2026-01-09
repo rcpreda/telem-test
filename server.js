@@ -123,12 +123,12 @@ const server = net.createServer(socket => {
             log(`    GPS: Lat=${record.gps.latitude}, Lon=${record.gps.longitude}`);
             log(`    Altitude: ${record.gps.altitude}m, Angle: ${record.gps.angle}°`);
             log(`    Speed: ${record.gps.speed} km/h, Satellites: ${record.gps.satellites}`);
-            log(`    IO Event ID: ${record.io.eventId}, Total Elements: ${record.io.totalElements}`);
+            log(`    IO Event ID: ${record.io.eventIoId}, Total Elements: ${record.io.totalCount}`);
 
-            // Log IO elements
-            for (const [id, elem] of Object.entries(record.io.elements)) {
+            // Log IO elements (now an array)
+            for (const elem of record.io.elements) {
                 const rawHex = elem.raw ? elem.raw.toString('hex') : 'N/A';
-                log(`      [${id}] ${elem.name}: ${elem.value} (hex: ${rawHex})`);
+                log(`      [${elem.id}] ${elem.name}: ${elem.value} (hex: ${rawHex})`);
             }
         });
 
