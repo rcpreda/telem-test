@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  telem:
+    build: .
+    container_name: telem-server
+    restart: unless-stopped
+    ports:
+      - "5027:5027"
+      - "3000:3000"
+    volumes:
+      - ./logs:/app/logs
+    environment:
+      - NODE_ENV=production
+      - MONGO_URI=mongodb://mongo:27017/telem
+    depends_on:
+      - mongo
+    networks:
+      - telem-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  mongo:
+    image: mongo:7
+    container_name: telem-mongo
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - telem-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  telem-network:
+    driver: bridge
+
+volumes:
+  mongo_data:
