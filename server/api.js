@@ -268,45 +268,488 @@ app.get('/devices/:imei/trips', async (req, res) => {
         const collection = getCollectionName('records', device.modemType);
         const limit = Math.min(parseInt(req.query.limit) || 20, 100);
 
-        // Get records with ignition changes
+        // Get all records (we need all data to calculate stats)
         const records = await db.collection(collection)
             .find({
                 imei: req.params.imei,
                 ignition: { $exists: true }
             })
-            .sort({ timestamp: -1 })
-            .limit(1000)
+            .sort({ timestamp: 1 })  // Sort ascending for easier processing
             .toArray();
 
         // Group into trips (ignition on -> ignition off)
         const trips = [];
         let currentTrip = null;
+        let tripRecords = [];
 
-        for (let i = records.length - 1; i >= 0; i--) {
-            const record = records[i];
-
+        for (const record of records) {
             if (record.ignition === 1 && !currentTrip) {
+                // Trip starts
                 currentTrip = {
                     startTime: record.timestamp,
-                    startPosition: record.gps,
                     startOdometer: record.totalOdometer
                 };
+                tripRecords = [record];
+            } else if (record.ignition === 1 && currentTrip) {
+                // During trip - collect record
+                tripRecords.push(record);
             } else if (record.ignition === 0 && currentTrip) {
+                // Trip ends
+                tripRecords.push(record);
+
                 currentTrip.endTime = record.timestamp;
-                currentTrip.endPosition = record.gps;
                 currentTrip.endOdometer = record.totalOdometer;
+
+                // Calculate distance in meters and km
                 if (currentTrip.startOdometer && currentTrip.endOdometer) {
-                    currentTrip.distance = currentTrip.endOdometer - currentTrip.startOdometer;
+                    currentTrip.distanceMeters = currentTrip.endOdometer - currentTrip.startOdometer;
+                    currentTrip.distanceKm = Math.round(currentTrip.distanceMeters / 100) / 10; // 1 decimal
                 }
+
+                // Calculate duration
+                const startDate = new Date(currentTrip.startTime);
+                const endDate = new Date(currentTrip.endTime);
+                const durationMs = endDate - startDate;
+                const totalMinutes = Math.round(durationMs / 60000);
+                const hours = Math.floor(totalMinutes / 60);
+                const minutes = totalMinutes % 60;
+                currentTrip.duration = hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
+                currentTrip.durationMinutes = totalMinutes;
+
+                // Calculate average speed from distance/time (includes stops)
+                if (currentTrip.distanceMeters && totalMinutes > 0) {
+                    const durationHours = totalMinutes / 60;
+                    currentTrip.avgSpeedTotal = Math.round(currentTrip.distanceKm / durationHours * 10) / 10;
+                }
+
+                // Find max speed and calculate avg from OBD/GPS records (only when moving)
+                let maxSpeed = 0;
+                let speedSum = 0;
+                let speedCount = 0;
+
+                for (const r of tripRecords) {
+                    // Prefer OBD speed if available
+                    const speed = r.obdVehicleSpeed || r.gps?.speed || 0;
+                    if (speed > 0) {
+                        speedSum += speed;
+                        speedCount++;
+                        if (speed > maxSpeed) {
+                            maxSpeed = speed;
+                        }
+                    }
+                }
+
+                currentTrip.maxSpeed = maxSpeed;
+                if (speedCount > 0) {
+                    currentTrip.avgSpeedMoving = Math.round(speedSum / speedCount * 10) / 10;
+                }
+
+                // Calculate fuel consumption
+                const startFuel = tripRecords[0].fuelUsedGps;
+                const endFuel = tripRecords[tripRecords.length - 1].fuelUsedGps;
+                if (startFuel !== undefined && endFuel !== undefined) {
+                    const fuelUsedMl = endFuel - startFuel;
+                    currentTrip.fuelUsedMl = fuelUsedMl;
+                    currentTrip.fuelUsedLiters = Math.round(fuelUsedMl / 10) / 100; // ml to liters with 2 decimals
+
+                    // Calculate consumption per 100km
+                    if (currentTrip.distanceKm > 0) {
+                        currentTrip.fuelPer100km = Math.round((currentTrip.fuelUsedLiters / currentTrip.distanceKm) * 100 * 10) / 10;
+                    }
+                }
+
+                // Find first/last position with valid GPS (satellites > 0)
+                const validGpsRecords = tripRecords.filter(r => r.gps?.satellites > 0);
+                if (validGpsRecords.length > 0) {
+                    currentTrip.startPosition = validGpsRecords[0].gps;
+                    currentTrip.endPosition = validGpsRecords[validGpsRecords.length - 1].gps;
+                } else {
+                    // Fallback to ignition on/off positions
+                    currentTrip.startPosition = tripRecords[0].gps;
+                    currentTrip.endPosition = tripRecords[tripRecords.length - 1].gps;
+                }
+
+                currentTrip.recordCount = tripRecords.length;
+
                 trips.push(currentTrip);
                 currentTrip = null;
+                tripRecords = [];
             }
         }
+
+        // Sort trips by start time descending (most recent first)
+        trips.sort((a, b) => new Date(b.startTime) - new Date(a.startTime));
 
         res.json({
             device: req.params.imei,
             count: Math.min(trips.length, limit),
             trips: trips.slice(0, limit)
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ============ DAILY STATS ============
+
+// Get daily statistics for a device
+app.get('/devices/:imei/daily/:date?', async (req, res) => {
+    try {
+        const db = getDb();
+
+        const device = await db.collection('devices').findOne({ imei: req.params.imei });
+        if (!device) {
+            return res.status(404).json({ error: 'Device not found' });
+        }
+
+        const collection = getCollectionName('records', device.modemType);
+
+        // Parse date or use today
+        let targetDate;
+        if (req.params.date) {
+            targetDate = new Date(req.params.date);
+        } else {
+            targetDate = new Date();
+        }
+        targetDate.setHours(0, 0, 0, 0);
+
+        const nextDay = new Date(targetDate);
+        nextDay.setDate(nextDay.getDate() + 1);
+
+        const dateStr = targetDate.toISOString().split('T')[0];
+
+        // Get all records for the day
+        const records = await db.collection(collection)
+            .find({
+                imei: req.params.imei,
+                timestamp: {
+                    $gte: targetDate.toISOString(),
+                    $lt: nextDay.toISOString()
+                }
+            })
+            .sort({ timestamp: 1 })
+            .toArray();
+
+        if (records.length === 0) {
+            return res.json({
+                device: req.params.imei,
+                date: dateStr,
+                message: 'No data for this day',
+                recordCount: 0
+            });
+        }
+
+        // Calculate distance (odometer difference)
+        const firstOdometer = records[0].totalOdometer;
+        const lastOdometer = records[records.length - 1].totalOdometer;
+        const distanceMeters = lastOdometer - firstOdometer;
+        const distanceKm = Math.round(distanceMeters / 100) / 10;
+
+        // Calculate fuel consumption
+        const firstFuel = records[0].fuelUsedGps;
+        const lastFuel = records[records.length - 1].fuelUsedGps;
+        let fuelUsedMl = 0;
+        let fuelUsedLiters = 0;
+        let fuelPer100km = null;
+        if (firstFuel !== undefined && lastFuel !== undefined) {
+            fuelUsedMl = lastFuel - firstFuel;
+            fuelUsedLiters = Math.round(fuelUsedMl / 10) / 100;
+            if (distanceKm > 0) {
+                fuelPer100km = Math.round((fuelUsedLiters / distanceKm) * 100 * 10) / 10;
+            }
+        }
+
+        // Calculate averages
+        let batteryVoltageOnSum = 0, batteryVoltageOnCount = 0;
+        let batteryVoltageOffSum = 0, batteryVoltageOffCount = 0;
+        let externalVoltageOnSum = 0, externalVoltageOnCount = 0;
+        let externalVoltageOffSum = 0, externalVoltageOffCount = 0;
+        let minExternalVoltageOn = Infinity, maxExternalVoltageOn = 0;
+        let minExternalVoltageOff = Infinity, maxExternalVoltageOff = 0;
+        let speedSum = 0, speedCount = 0;
+        let maxSpeed = 0;
+        let engineRpmSum = 0, engineRpmCount = 0;
+        let maxRpm = 0;
+        let coolantTempSum = 0, coolantTempCount = 0;
+        let maxCoolantTemp = 0;
+        let engineLoadSum = 0, engineLoadCount = 0;
+
+        let ignitionOnTime = 0;
+        let lastIgnitionOn = null;
+        let tripCount = 0;
+
+        for (const r of records) {
+            const isIgnitionOn = r.ignition === 1;
+
+            // Battery voltage (mV) - separate by ignition state
+            if (r.batteryVoltage) {
+                if (isIgnitionOn) {
+                    batteryVoltageOnSum += r.batteryVoltage;
+                    batteryVoltageOnCount++;
+                } else {
+                    batteryVoltageOffSum += r.batteryVoltage;
+                    batteryVoltageOffCount++;
+                }
+            }
+
+            // External voltage (mV) - separate by ignition state
+            if (r.externalVoltage) {
+                if (isIgnitionOn) {
+                    externalVoltageOnSum += r.externalVoltage;
+                    externalVoltageOnCount++;
+                    if (r.externalVoltage < minExternalVoltageOn) minExternalVoltageOn = r.externalVoltage;
+                    if (r.externalVoltage > maxExternalVoltageOn) maxExternalVoltageOn = r.externalVoltage;
+                } else {
+                    externalVoltageOffSum += r.externalVoltage;
+                    externalVoltageOffCount++;
+                    if (r.externalVoltage < minExternalVoltageOff) minExternalVoltageOff = r.externalVoltage;
+                    if (r.externalVoltage > maxExternalVoltageOff) maxExternalVoltageOff = r.externalVoltage;
+                }
+            }
+
+            // Speed (OBD or GPS)
+            const speed = r.obdVehicleSpeed || r.gps?.speed || 0;
+            if (speed > 0) {
+                speedSum += speed;
+                speedCount++;
+                if (speed > maxSpeed) maxSpeed = speed;
+            }
+
+            // Engine RPM
+            if (r.obdEngineRpm) {
+                engineRpmSum += r.obdEngineRpm;
+                engineRpmCount++;
+                if (r.obdEngineRpm > maxRpm) maxRpm = r.obdEngineRpm;
+            }
+
+            // Coolant temperature
+            if (r.obdCoolantTemp) {
+                coolantTempSum += r.obdCoolantTemp;
+                coolantTempCount++;
+                if (r.obdCoolantTemp > maxCoolantTemp) maxCoolantTemp = r.obdCoolantTemp;
+            }
+
+            // Engine load
+            if (r.obdEngineLoad) {
+                engineLoadSum += r.obdEngineLoad;
+                engineLoadCount++;
+            }
+
+            // Ignition time tracking
+            if (r.ignition === 1 && !lastIgnitionOn) {
+                lastIgnitionOn = new Date(r.timestamp);
+                tripCount++;
+            } else if (r.ignition === 0 && lastIgnitionOn) {
+                ignitionOnTime += new Date(r.timestamp) - lastIgnitionOn;
+                lastIgnitionOn = null;
+            }
+        }
+
+        // If ignition still on at end of day
+        if (lastIgnitionOn) {
+            const endOfRecords = new Date(records[records.length - 1].timestamp);
+            ignitionOnTime += endOfRecords - lastIgnitionOn;
+        }
+
+        const drivingMinutes = Math.round(ignitionOnTime / 60000);
+        const drivingHours = Math.floor(drivingMinutes / 60);
+        const drivingMins = drivingMinutes % 60;
+
+        res.json({
+            device: req.params.imei,
+            date: dateStr,
+            recordCount: records.length,
+            tripCount,
+
+            // Distance & Fuel
+            distance: {
+                meters: distanceMeters,
+                km: distanceKm
+            },
+            fuel: {
+                usedMl: fuelUsedMl,
+                usedLiters: fuelUsedLiters,
+                per100km: fuelPer100km
+            },
+
+            // Time
+            drivingTime: {
+                minutes: drivingMinutes,
+                formatted: drivingHours > 0 ? `${drivingHours}h ${drivingMins}m` : `${drivingMins}m`
+            },
+
+            // Speed
+            speed: {
+                max: maxSpeed,
+                avg: speedCount > 0 ? Math.round(speedSum / speedCount * 10) / 10 : 0
+            },
+
+            // Voltage - separated by ignition state
+            voltage: {
+                ignitionOn: {
+                    batteryAvg: batteryVoltageOnCount > 0 ? Math.round(batteryVoltageOnSum / batteryVoltageOnCount) / 1000 : null,
+                    externalAvg: externalVoltageOnCount > 0 ? Math.round(externalVoltageOnSum / externalVoltageOnCount) / 1000 : null,
+                    externalMin: externalVoltageOnCount > 0 ? Math.round(minExternalVoltageOn) / 1000 : null,
+                    externalMax: externalVoltageOnCount > 0 ? Math.round(maxExternalVoltageOn) / 1000 : null
+                },
+                ignitionOff: {
+                    batteryAvg: batteryVoltageOffCount > 0 ? Math.round(batteryVoltageOffSum / batteryVoltageOffCount) / 1000 : null,
+                    externalAvg: externalVoltageOffCount > 0 ? Math.round(externalVoltageOffSum / externalVoltageOffCount) / 1000 : null,
+                    externalMin: externalVoltageOffCount > 0 ? Math.round(minExternalVoltageOff) / 1000 : null,
+                    externalMax: externalVoltageOffCount > 0 ? Math.round(maxExternalVoltageOff) / 1000 : null
+                }
+            },
+
+            // Engine (OBD)
+            engine: {
+                rpmMax: maxRpm,
+                rpmAvg: engineRpmCount > 0 ? Math.round(engineRpmSum / engineRpmCount) : 0,
+                coolantTempMax: maxCoolantTemp,
+                coolantTempAvg: coolantTempCount > 0 ? Math.round(coolantTempSum / coolantTempCount) : 0,
+                loadAvg: engineLoadCount > 0 ? Math.round(engineLoadSum / engineLoadCount) : 0
+            },
+
+            // First and last position
+            firstPosition: records[0].gps,
+            lastPosition: records[records.length - 1].gps,
+            firstTimestamp: records[0].timestamp,
+            lastTimestamp: records[records.length - 1].timestamp
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Get daily stats for date range
+app.get('/devices/:imei/daily-range', async (req, res) => {
+    try {
+        const db = getDb();
+        const { from, to } = req.query;
+
+        if (!from || !to) {
+            return res.status(400).json({ error: 'Missing from or to parameter (format: YYYY-MM-DD)' });
+        }
+
+        const device = await db.collection('devices').findOne({ imei: req.params.imei });
+        if (!device) {
+            return res.status(404).json({ error: 'Device not found' });
+        }
+
+        const collection = getCollectionName('records', device.modemType);
+
+        // Get aggregated daily stats
+        const startDate = new Date(from);
+        const endDate = new Date(to);
+        endDate.setDate(endDate.getDate() + 1);
+
+        const pipeline = [
+            {
+                $match: {
+                    imei: req.params.imei,
+                    timestamp: { $gte: startDate.toISOString(), $lt: endDate.toISOString() }
+                }
+            },
+            {
+                $addFields: {
+                    date: { $substr: ['$timestamp', 0, 10] }
+                }
+            },
+            {
+                $group: {
+                    _id: '$date',
+                    recordCount: { $sum: 1 },
+                    firstOdometer: { $first: '$totalOdometer' },
+                    lastOdometer: { $last: '$totalOdometer' },
+                    firstFuel: { $first: '$fuelUsedGps' },
+                    lastFuel: { $last: '$fuelUsedGps' },
+                    maxSpeed: { $max: '$obdVehicleSpeed' },
+                    avgSpeed: { $avg: '$obdVehicleSpeed' },
+                    maxRpm: { $max: '$obdEngineRpm' },
+                    avgRpm: { $avg: '$obdEngineRpm' },
+                    maxCoolantTemp: { $max: '$obdCoolantTemp' },
+                    avgCoolantTemp: { $avg: '$obdCoolantTemp' },
+                    avgEngineLoad: { $avg: '$obdEngineLoad' },
+                    records: { $push: { ignition: '$ignition', batteryVoltage: '$batteryVoltage', externalVoltage: '$externalVoltage' } }
+                }
+            },
+            { $sort: { _id: 1 } }
+        ];
+
+        const results = await db.collection(collection).aggregate(pipeline).toArray();
+
+        const days = results.map(r => {
+            const distanceMeters = (r.lastOdometer || 0) - (r.firstOdometer || 0);
+            const fuelUsedMl = (r.lastFuel || 0) - (r.firstFuel || 0);
+            const distanceKm = Math.round(distanceMeters / 100) / 10;
+            const fuelUsedLiters = Math.round(fuelUsedMl / 10) / 100;
+
+            // Calculate voltage by ignition state
+            let battOnSum = 0, battOnCnt = 0, battOffSum = 0, battOffCnt = 0;
+            let extOnSum = 0, extOnCnt = 0, extOffSum = 0, extOffCnt = 0;
+            let extOnMin = Infinity, extOnMax = 0, extOffMin = Infinity, extOffMax = 0;
+            let tripCount = 0, lastIgnition = null;
+
+            for (const rec of r.records) {
+                if (rec.ignition === 1 && lastIgnition !== 1) tripCount++;
+                lastIgnition = rec.ignition;
+
+                if (rec.ignition === 1) {
+                    if (rec.batteryVoltage) { battOnSum += rec.batteryVoltage; battOnCnt++; }
+                    if (rec.externalVoltage) {
+                        extOnSum += rec.externalVoltage; extOnCnt++;
+                        if (rec.externalVoltage < extOnMin) extOnMin = rec.externalVoltage;
+                        if (rec.externalVoltage > extOnMax) extOnMax = rec.externalVoltage;
+                    }
+                } else {
+                    if (rec.batteryVoltage) { battOffSum += rec.batteryVoltage; battOffCnt++; }
+                    if (rec.externalVoltage) {
+                        extOffSum += rec.externalVoltage; extOffCnt++;
+                        if (rec.externalVoltage < extOffMin) extOffMin = rec.externalVoltage;
+                        if (rec.externalVoltage > extOffMax) extOffMax = rec.externalVoltage;
+                    }
+                }
+            }
+
+            return {
+                date: r._id,
+                recordCount: r.recordCount,
+                tripCount,
+                distanceKm,
+                fuelUsedLiters,
+                fuelPer100km: distanceKm > 0 ? Math.round((fuelUsedLiters / distanceKm) * 100 * 10) / 10 : null,
+                speed: {
+                    max: r.maxSpeed || 0,
+                    avg: r.avgSpeed ? Math.round(r.avgSpeed * 10) / 10 : 0
+                },
+                engine: {
+                    rpmMax: r.maxRpm || 0,
+                    rpmAvg: r.avgRpm ? Math.round(r.avgRpm) : 0,
+                    coolantTempMax: r.maxCoolantTemp || 0,
+                    coolantTempAvg: r.avgCoolantTemp ? Math.round(r.avgCoolantTemp) : 0,
+                    loadAvg: r.avgEngineLoad ? Math.round(r.avgEngineLoad) : 0
+                },
+                voltage: {
+                    ignitionOn: {
+                        batteryAvg: battOnCnt > 0 ? Math.round(battOnSum / battOnCnt) / 1000 : null,
+                        externalAvg: extOnCnt > 0 ? Math.round(extOnSum / extOnCnt) / 1000 : null,
+                        externalMin: extOnCnt > 0 ? Math.round(extOnMin) / 1000 : null,
+                        externalMax: extOnCnt > 0 ? Math.round(extOnMax) / 1000 : null
+                    },
+                    ignitionOff: {
+                        batteryAvg: battOffCnt > 0 ? Math.round(battOffSum / battOffCnt) / 1000 : null,
+                        externalAvg: extOffCnt > 0 ? Math.round(extOffSum / extOffCnt) / 1000 : null,
+                        externalMin: extOffCnt > 0 ? Math.round(extOffMin) / 1000 : null,
+                        externalMax: extOffCnt > 0 ? Math.round(extOffMax) / 1000 : null
+                    }
+                }
+            };
+        });
+
+        res.json({
+            device: req.params.imei,
+            from,
+            to,
+            days
         });
     } catch (err) {
         res.status(500).json({ error: err.message });

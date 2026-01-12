@@ -124,6 +124,8 @@ function buildRecordDoc(imei, vin, modemType, record) {
 function ioIdToFieldName(id) {
     const fieldMap = {
         // Core telemetry
+        12: 'fuelUsedGps',
+        13: 'fuelRateGps',
         16: 'totalOdometer',
         21: 'gsmSignal',
         24: 'speedIO',
