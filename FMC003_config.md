@@ -55,3 +55,8 @@
 | 240 | Movement | 0=stopped, 1=moving |
 | 241 | GSM Operator | Operator code |
 | 256 | VIN | Vehicle ID Number |
+
+
+- https://wiki.teltonika-gps.com/view/FMC003_Parameter_list - lista completă de parametri IO
+- https://wiki.teltonika-gps.com/view/FMC003_Features_settings - configurare funcționalități
+- https://www.teltonika-gps.com/products/trackers/obd-data/fmc003 - pagina oficială

@@ -277,103 +277,131 @@ app.get('/devices/:imei/trips', async (req, res) => {
             .sort({ timestamp: 1 })  // Sort ascending for easier processing
             .toArray();
 
-        // Group into trips (ignition on -> ignition off)
+        // Group into trips based on engine running (RPM > 0 or ignition with timeout)
         const trips = [];
         let currentTrip = null;
         let tripRecords = [];
+        let lastEngineOnTime = null;
+
+        // Engine is considered ON if ignition=1 OR rpm > 0
+        const isEngineOn = (r) => r.ignition === 1 || (r.obdEngineRpm && r.obdEngineRpm > 0);
 
         for (const record of records) {
-            if (record.ignition === 1 && !currentTrip) {
+            const engineOn = isEngineOn(record);
+
+            if (engineOn && !currentTrip) {
                 // Trip starts
                 currentTrip = {
                     startTime: record.timestamp,
                     startOdometer: record.totalOdometer
                 };
                 tripRecords = [record];
-            } else if (record.ignition === 1 && currentTrip) {
+                lastEngineOnTime = new Date(record.timestamp);
+            } else if (engineOn && currentTrip) {
                 // During trip - collect record
                 tripRecords.push(record);
-            } else if (record.ignition === 0 && currentTrip) {
-                // Trip ends
-                tripRecords.push(record);
+                lastEngineOnTime = new Date(record.timestamp);
+            } else if (!engineOn && currentTrip) {
+                // Check if engine has been off for more than 60 seconds
+                const timeSinceLastOn = new Date(record.timestamp) - lastEngineOnTime;
 
-                currentTrip.endTime = record.timestamp;
-                currentTrip.endOdometer = record.totalOdometer;
+                if (timeSinceLastOn > 60000) {
+                    // Trip ends - use the last record where engine was on
+                    const lastOnRecord = tripRecords[tripRecords.length - 1];
 
-                // Calculate distance in meters and km
-                if (currentTrip.startOdometer && currentTrip.endOdometer) {
-                    currentTrip.distanceMeters = currentTrip.endOdometer - currentTrip.startOdometer;
-                    currentTrip.distanceKm = Math.round(currentTrip.distanceMeters / 100) / 10; // 1 decimal
-                }
+                    currentTrip.endTime = lastOnRecord.timestamp;
+                    currentTrip.endOdometer = lastOnRecord.totalOdometer;
 
-                // Calculate duration
-                const startDate = new Date(currentTrip.startTime);
-                const endDate = new Date(currentTrip.endTime);
-                const durationMs = endDate - startDate;
-                const totalMinutes = Math.round(durationMs / 60000);
-                const hours = Math.floor(totalMinutes / 60);
-                const minutes = totalMinutes % 60;
-                currentTrip.duration = hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
-                currentTrip.durationMinutes = totalMinutes;
+                    // Calculate distance in meters and km
+                    if (currentTrip.startOdometer && currentTrip.endOdometer) {
+                        currentTrip.distanceMeters = currentTrip.endOdometer - currentTrip.startOdometer;
+                        currentTrip.distanceKm = Math.round(currentTrip.distanceMeters / 100) / 10;
+                    }
 
-                // Calculate average speed from distance/time (includes stops)
-                if (currentTrip.distanceMeters && totalMinutes > 0) {
-                    const durationHours = totalMinutes / 60;
-                    currentTrip.avgSpeedTotal = Math.round(currentTrip.distanceKm / durationHours * 10) / 10;
-                }
-
-                // Find max speed and calculate avg from OBD/GPS records (only when moving)
-                let maxSpeed = 0;
-                let speedSum = 0;
-                let speedCount = 0;
-
-                for (const r of tripRecords) {
-                    // Prefer OBD speed if available
-                    const speed = r.obdVehicleSpeed || r.gps?.speed || 0;
-                    if (speed > 0) {
-                        speedSum += speed;
-                        speedCount++;
-                        if (speed > maxSpeed) {
-                            maxSpeed = speed;
+                    // If odometer didn't change but we have speed data, estimate distance from speed × time
+                    if (currentTrip.distanceMeters === 0 || !currentTrip.distanceMeters) {
+                        let estimatedDistanceMeters = 0;
+                        for (let i = 1; i < tripRecords.length; i++) {
+                            const prevTime = new Date(tripRecords[i - 1].timestamp);
+                            const currTime = new Date(tripRecords[i].timestamp);
+                            const deltaSeconds = (currTime - prevTime) / 1000;
+                            const speed = tripRecords[i - 1].obdVehicleSpeed || tripRecords[i - 1].gps?.speed || 0;
+                            // speed is km/h, convert to m/s then multiply by time
+                            estimatedDistanceMeters += (speed / 3.6) * deltaSeconds;
+                        }
+                        if (estimatedDistanceMeters > 0) {
+                            currentTrip.distanceMeters = Math.round(estimatedDistanceMeters);
+                            currentTrip.distanceKm = Math.round(estimatedDistanceMeters / 100) / 10;
+                            currentTrip.distanceEstimated = true;
                         }
                     }
-                }
 
-                currentTrip.maxSpeed = maxSpeed;
-                if (speedCount > 0) {
-                    currentTrip.avgSpeedMoving = Math.round(speedSum / speedCount * 10) / 10;
-                }
+                    // Calculate duration
+                    const startDate = new Date(currentTrip.startTime);
+                    const endDate = new Date(currentTrip.endTime);
+                    const durationMs = endDate - startDate;
+                    const totalMinutes = Math.round(durationMs / 60000);
+                    const hours = Math.floor(totalMinutes / 60);
+                    const minutes = totalMinutes % 60;
+                    currentTrip.duration = hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
+                    currentTrip.durationMinutes = totalMinutes;
 
-                // Calculate fuel consumption
-                const startFuel = tripRecords[0].fuelUsedGps;
-                const endFuel = tripRecords[tripRecords.length - 1].fuelUsedGps;
-                if (startFuel !== undefined && endFuel !== undefined) {
-                    const fuelUsedMl = endFuel - startFuel;
-                    currentTrip.fuelUsedMl = fuelUsedMl;
-                    currentTrip.fuelUsedLiters = Math.round(fuelUsedMl / 10) / 100; // ml to liters with 2 decimals
-
-                    // Calculate consumption per 100km
-                    if (currentTrip.distanceKm > 0) {
-                        currentTrip.fuelPer100km = Math.round((currentTrip.fuelUsedLiters / currentTrip.distanceKm) * 100 * 10) / 10;
+                    // Calculate average speed from distance/time (includes stops)
+                    if (currentTrip.distanceMeters && totalMinutes > 0) {
+                        const durationHours = totalMinutes / 60;
+                        currentTrip.avgSpeedTotal = Math.round(currentTrip.distanceKm / durationHours * 10) / 10;
                     }
+
+                    // Find max speed and calculate avg from OBD/GPS records (only when moving)
+                    let maxSpeed = 0;
+                    let speedSum = 0;
+                    let speedCount = 0;
+
+                    for (const r of tripRecords) {
+                        const speed = r.obdVehicleSpeed || r.gps?.speed || 0;
+                        if (speed > 0) {
+                            speedSum += speed;
+                            speedCount++;
+                            if (speed > maxSpeed) maxSpeed = speed;
+                        }
+                    }
+
+                    currentTrip.maxSpeed = maxSpeed;
+                    if (speedCount > 0) {
+                        currentTrip.avgSpeedMoving = Math.round(speedSum / speedCount * 10) / 10;
+                    }
+
+                    // Calculate fuel consumption
+                    const startFuel = tripRecords[0].fuelUsedGps;
+                    const endFuel = tripRecords[tripRecords.length - 1].fuelUsedGps;
+                    if (startFuel !== undefined && endFuel !== undefined) {
+                        const fuelUsedMl = endFuel - startFuel;
+                        currentTrip.fuelUsedMl = fuelUsedMl;
+                        currentTrip.fuelUsedLiters = Math.round(fuelUsedMl / 10) / 100;
+
+                        if (currentTrip.distanceKm > 0) {
+                            currentTrip.fuelPer100km = Math.round((currentTrip.fuelUsedLiters / currentTrip.distanceKm) * 100 * 10) / 10;
+                        }
+                    }
+
+                    // Find first/last position with valid GPS (satellites > 0)
+                    const validGpsRecords = tripRecords.filter(r => r.gps?.satellites > 0);
+                    if (validGpsRecords.length > 0) {
+                        currentTrip.startPosition = validGpsRecords[0].gps;
+                        currentTrip.endPosition = validGpsRecords[validGpsRecords.length - 1].gps;
+                    } else {
+                        currentTrip.startPosition = tripRecords[0].gps;
+                        currentTrip.endPosition = tripRecords[tripRecords.length - 1].gps;
+                    }
+
+                    // Only add trip if it has meaningful data (duration >= 2 min or distance > 100m)
+                    if (currentTrip.durationMinutes >= 2 || currentTrip.distanceMeters > 100) {
+                        trips.push(currentTrip);
+                    }
+                    currentTrip = null;
+                    tripRecords = [];
                 }
-
-                // Find first/last position with valid GPS (satellites > 0)
-                const validGpsRecords = tripRecords.filter(r => r.gps?.satellites > 0);
-                if (validGpsRecords.length > 0) {
-                    currentTrip.startPosition = validGpsRecords[0].gps;
-                    currentTrip.endPosition = validGpsRecords[validGpsRecords.length - 1].gps;
-                } else {
-                    // Fallback to ignition on/off positions
-                    currentTrip.startPosition = tripRecords[0].gps;
-                    currentTrip.endPosition = tripRecords[tripRecords.length - 1].gps;
-                }
-
-                currentTrip.recordCount = tripRecords.length;
-
-                trips.push(currentTrip);
-                currentTrip = null;
-                tripRecords = [];
+                // else: engine briefly off, keep collecting records
             }
         }
 
@@ -479,11 +507,12 @@ app.get('/devices/:imei/daily/:date?', async (req, res) => {
         let tripCount = 0;
 
         for (const r of records) {
-            const isIgnitionOn = r.ignition === 1;
+            // Engine ON = alternator charging (ignition + rpm or movement or speed)
+            const isEngineOn = r.ignition === 1 && (r.movement === 1 || r.obdVehicleSpeed > 0 || r.obdEngineRpm > 0);
 
-            // Battery voltage (mV) - separate by ignition state
+            // Battery voltage (mV) - separate by engine state
             if (r.batteryVoltage) {
-                if (isIgnitionOn) {
+                if (isEngineOn) {
                     batteryVoltageOnSum += r.batteryVoltage;
                     batteryVoltageOnCount++;
                 } else {
@@ -492,9 +521,9 @@ app.get('/devices/:imei/daily/:date?', async (req, res) => {
                 }
             }
 
-            // External voltage (mV) - separate by ignition state
+            // External voltage (mV) - separate by engine state
             if (r.externalVoltage) {
-                if (isIgnitionOn) {
+                if (isEngineOn) {
                     externalVoltageOnSum += r.externalVoltage;
                     externalVoltageOnCount++;
                     if (r.externalVoltage < minExternalVoltageOn) minExternalVoltageOn = r.externalVoltage;
@@ -669,7 +698,7 @@ app.get('/devices/:imei/daily-range', async (req, res) => {
                     maxCoolantTemp: { $max: '$obdCoolantTemp' },
                     avgCoolantTemp: { $avg: '$obdCoolantTemp' },
                     avgEngineLoad: { $avg: '$obdEngineLoad' },
-                    records: { $push: { ignition: '$ignition', batteryVoltage: '$batteryVoltage', externalVoltage: '$externalVoltage' } }
+                    records: { $push: { ignition: '$ignition', movement: '$movement', obdVehicleSpeed: '$obdVehicleSpeed', obdEngineRpm: '$obdEngineRpm', batteryVoltage: '$batteryVoltage', externalVoltage: '$externalVoltage' } }
                 }
             },
             { $sort: { _id: 1 } }
@@ -693,7 +722,10 @@ app.get('/devices/:imei/daily-range', async (req, res) => {
                 if (rec.ignition === 1 && lastIgnition !== 1) tripCount++;
                 lastIgnition = rec.ignition;
 
-                if (rec.ignition === 1) {
+                // Engine ON = alternator charging (ignition + rpm or movement or speed)
+                const isEngineOn = rec.ignition === 1 && (rec.movement === 1 || rec.obdVehicleSpeed > 0 || rec.obdEngineRpm > 0);
+
+                if (isEngineOn) {
                     if (rec.batteryVoltage) { battOnSum += rec.batteryVoltage; battOnCnt++; }
                     if (rec.externalVoltage) {
                         extOnSum += rec.externalVoltage; extOnCnt++;
