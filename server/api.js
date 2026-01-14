@@ -505,6 +505,8 @@ app.get('/devices/:imei/daily/:date?', async (req, res) => {
         let ignitionOnTime = 0;
         let lastIgnitionOn = null;
         let tripCount = 0;
+        let inTrip = false;
+        let lastEngineOnTime = null;
 
         for (const r of records) {
             // Engine ON = alternator charging (ignition + rpm or movement or speed)
@@ -564,20 +566,35 @@ app.get('/devices/:imei/daily/:date?', async (req, res) => {
                 engineLoadCount++;
             }
 
-            // Ignition time tracking
-            if (r.ignition === 1 && !lastIgnitionOn) {
-                lastIgnitionOn = new Date(r.timestamp);
+            // Trip counting with engine-based logic (same as trips endpoint)
+            const engineOn = r.ignition === 1 || (r.obdEngineRpm && r.obdEngineRpm > 0);
+
+            if (engineOn && !inTrip) {
+                // New trip starts
+                inTrip = true;
                 tripCount++;
-            } else if (r.ignition === 0 && lastIgnitionOn) {
-                ignitionOnTime += new Date(r.timestamp) - lastIgnitionOn;
-                lastIgnitionOn = null;
+                lastEngineOnTime = new Date(r.timestamp);
+                if (!lastIgnitionOn) lastIgnitionOn = new Date(r.timestamp);
+            } else if (engineOn && inTrip) {
+                // Still in trip
+                lastEngineOnTime = new Date(r.timestamp);
+            } else if (!engineOn && inTrip) {
+                // Check if engine has been off for > 60 seconds
+                const timeSinceLastOn = new Date(r.timestamp) - lastEngineOnTime;
+                if (timeSinceLastOn > 60000) {
+                    // Trip ends
+                    inTrip = false;
+                    if (lastIgnitionOn) {
+                        ignitionOnTime += lastEngineOnTime - lastIgnitionOn;
+                        lastIgnitionOn = null;
+                    }
+                }
             }
         }
 
-        // If ignition still on at end of day
-        if (lastIgnitionOn) {
-            const endOfRecords = new Date(records[records.length - 1].timestamp);
-            ignitionOnTime += endOfRecords - lastIgnitionOn;
+        // If still in trip at end of day, add remaining time
+        if (inTrip && lastIgnitionOn && lastEngineOnTime) {
+            ignitionOnTime += lastEngineOnTime - lastIgnitionOn;
         }
 
         const drivingMinutes = Math.round(ignitionOnTime / 60000);
@@ -712,17 +729,34 @@ app.get('/devices/:imei/daily-range', async (req, res) => {
             const distanceKm = Math.round(distanceMeters / 100) / 10;
             const fuelUsedLiters = Math.round(fuelUsedMl / 10) / 100;
 
-            // Calculate voltage by ignition state
+            // Calculate voltage by engine state and count trips
             let battOnSum = 0, battOnCnt = 0, battOffSum = 0, battOffCnt = 0;
             let extOnSum = 0, extOnCnt = 0, extOffSum = 0, extOffCnt = 0;
             let extOnMin = Infinity, extOnMax = 0, extOffMin = Infinity, extOffMax = 0;
-            let tripCount = 0, lastIgnition = null;
+            let tripCount = 0;
+            let inTrip = false;
+            let lastEngineOnIdx = -1;
 
-            for (const rec of r.records) {
-                if (rec.ignition === 1 && lastIgnition !== 1) tripCount++;
-                lastIgnition = rec.ignition;
+            for (let i = 0; i < r.records.length; i++) {
+                const rec = r.records[i];
+                // Engine ON = ignition + rpm or movement or speed
+                const engineOn = rec.ignition === 1 || (rec.obdEngineRpm && rec.obdEngineRpm > 0);
 
-                // Engine ON = alternator charging (ignition + rpm or movement or speed)
+                if (engineOn && !inTrip) {
+                    inTrip = true;
+                    tripCount++;
+                    lastEngineOnIdx = i;
+                } else if (engineOn && inTrip) {
+                    lastEngineOnIdx = i;
+                } else if (!engineOn && inTrip && lastEngineOnIdx >= 0) {
+                    // Simplified: count records since last engine on (approximate 60s timeout)
+                    // Since we don't have timestamps in aggregation, use record count (~5s intervals = 12 records for 60s)
+                    if (i - lastEngineOnIdx > 12) {
+                        inTrip = false;
+                    }
+                }
+
+                // Engine ON for voltage = alternator charging
                 const isEngineOn = rec.ignition === 1 && (rec.movement === 1 || rec.obdVehicleSpeed > 0 || rec.obdEngineRpm > 0);
 
                 if (isEngineOn) {
