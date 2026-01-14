@@ -371,16 +371,18 @@ app.get('/devices/:imei/trips', async (req, res) => {
                         currentTrip.avgSpeedMoving = Math.round(speedSum / speedCount * 10) / 10;
                     }
 
-                    // Calculate fuel consumption
+                    // Calculate fuel consumption (only for trips > 2km and > 5 minutes)
                     const startFuel = tripRecords[0].fuelUsedGps;
                     const endFuel = tripRecords[tripRecords.length - 1].fuelUsedGps;
                     if (startFuel !== undefined && endFuel !== undefined) {
                         const fuelUsedMl = endFuel - startFuel;
-                        currentTrip.fuelUsedMl = fuelUsedMl;
-                        currentTrip.fuelUsedLiters = Math.round(fuelUsedMl / 10) / 100;
 
-                        if (currentTrip.distanceKm > 0) {
+                        // Only show fuel data if trip is meaningful (>2km and >5min)
+                        if (currentTrip.distanceKm >= 2 && currentTrip.durationMinutes >= 5 && fuelUsedMl > 0) {
+                            currentTrip.fuelUsedMl = fuelUsedMl;
+                            currentTrip.fuelUsedLiters = Math.round(fuelUsedMl / 10) / 100;
                             currentTrip.fuelPer100km = Math.round((currentTrip.fuelUsedLiters / currentTrip.distanceKm) * 100 * 10) / 10;
+                            currentTrip.fuelEstimated = true; // Flag that this is GPS-estimated, not OBD
                         }
                     }
 
@@ -473,17 +475,19 @@ app.get('/devices/:imei/daily/:date?', async (req, res) => {
         const distanceMeters = lastOdometer - firstOdometer;
         const distanceKm = Math.round(distanceMeters / 100) / 10;
 
-        // Calculate fuel consumption
+        // Calculate fuel consumption (only if distance > 2km)
         const firstFuel = records[0].fuelUsedGps;
         const lastFuel = records[records.length - 1].fuelUsedGps;
-        let fuelUsedMl = 0;
-        let fuelUsedLiters = 0;
+        let fuelUsedMl = null;
+        let fuelUsedLiters = null;
         let fuelPer100km = null;
-        if (firstFuel !== undefined && lastFuel !== undefined) {
+        let fuelEstimated = false;
+        if (firstFuel !== undefined && lastFuel !== undefined && distanceKm >= 2) {
             fuelUsedMl = lastFuel - firstFuel;
-            fuelUsedLiters = Math.round(fuelUsedMl / 10) / 100;
-            if (distanceKm > 0) {
+            if (fuelUsedMl > 0) {
+                fuelUsedLiters = Math.round(fuelUsedMl / 10) / 100;
                 fuelPer100km = Math.round((fuelUsedLiters / distanceKm) * 100 * 10) / 10;
+                fuelEstimated = true; // GPS-estimated, not OBD
             }
         }
 
@@ -615,7 +619,8 @@ app.get('/devices/:imei/daily/:date?', async (req, res) => {
             fuel: {
                 usedMl: fuelUsedMl,
                 usedLiters: fuelUsedLiters,
-                per100km: fuelPer100km
+                per100km: fuelPer100km,
+                estimated: fuelEstimated
             },
 
             // Time
