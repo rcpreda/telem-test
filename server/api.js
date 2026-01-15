@@ -5,14 +5,27 @@ const { getCollectionName } = require('./models');
 
 const app = express();
 const API_PORT = process.env.API_PORT || 3000;
+const API_KEY = process.env.API_KEY || 'telem-secret-key-change-me';
 
 app.use(cors());
 app.use(express.json());
 
-// Health check
+// API Key authentication middleware
+const apiKeyAuth = (req, res, next) => {
+    const apiKey = req.headers['x-api-key'];
+    if (!apiKey || apiKey !== API_KEY) {
+        return res.status(401).json({ error: 'Unauthorized - Invalid or missing API key' });
+    }
+    next();
+};
+
+// Health check (no auth required)
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
+
+// Apply API key auth to all routes below
+app.use(apiKeyAuth);
 
 // ============ DEVICES ============
 

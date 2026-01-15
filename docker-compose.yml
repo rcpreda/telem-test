@@ -10,9 +10,8 @@ services:
       - "3000:3000"
     volumes:
       - ./logs:/app/logs
-    environment:
-      - NODE_ENV=production
-      - MONGO_URI=mongodb://mongo:27017/telem
+    env_file:
+      - .env
     depends_on:
       - mongo
     networks:
