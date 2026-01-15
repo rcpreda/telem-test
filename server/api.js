@@ -44,6 +44,78 @@ app.get('/devices/:imei', async (req, res) => {
     }
 });
 
+// Register new device (whitelist)
+app.post('/devices', async (req, res) => {
+    try {
+        const db = getDb();
+        const { imei, modemType, carBrand, carModel, plateNumber, notes } = req.body;
+
+        if (!imei || !/^\d{15}$/.test(imei)) {
+            return res.status(400).json({ error: 'Invalid IMEI (must be 15 digits)' });
+        }
+
+        // Check if already exists
+        const existing = await db.collection('devices').findOne({ imei });
+        if (existing) {
+            return res.status(409).json({ error: 'Device already registered', device: existing });
+        }
+
+        const device = {
+            imei,
+            modemType: modemType || 'FMC003',
+            carBrand: carBrand || null,
+            carModel: carModel || null,
+            plateNumber: plateNumber || null,
+            notes: notes || null,
+            approved: true,
+            createdAt: new Date()
+        };
+
+        await db.collection('devices').insertOne(device);
+        res.status(201).json(device);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Approve/reject device
+app.patch('/devices/:imei/approve', async (req, res) => {
+    try {
+        const db = getDb();
+        const { approved } = req.body;
+
+        const result = await db.collection('devices').updateOne(
+            { imei: req.params.imei },
+            { $set: { approved: approved !== false, updatedAt: new Date() } }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(404).json({ error: 'Device not found' });
+        }
+
+        const device = await db.collection('devices').findOne({ imei: req.params.imei });
+        res.json(device);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Delete device
+app.delete('/devices/:imei', async (req, res) => {
+    try {
+        const db = getDb();
+        const result = await db.collection('devices').deleteOne({ imei: req.params.imei });
+
+        if (result.deletedCount === 0) {
+            return res.status(404).json({ error: 'Device not found' });
+        }
+
+        res.json({ message: 'Device deleted', imei: req.params.imei });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // Update device info (car brand, model, plate, etc.)
 app.put('/devices/:imei', async (req, res) => {
     try {

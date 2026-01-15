@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const { decodeCodec8 } = require('./codec8');
 const { connect: connectDb } = require('./db');
-const { saveRawData, saveRecords, upsertDevice } = require('./models');
+const { saveRawData, saveRecords, upsertDevice, getDevice } = require('./models');
 const { startAPI } = require('./api');
 
 const PORT = 5027;
@@ -147,10 +147,23 @@ async function startServer() {
             // IMEI login phase
             const imei = parseIMEI(buffer);
             if (imei) {
-                deviceIMEI = imei;
-                clearTimeout(authTimeout); // Clear auth timeout on successful login
                 log(`[LOGIN] IMEI: ${imei}`);
                 log(`  Parsed from: length=${buffer.readUInt16BE(0)}, imei_bytes=${buffer.slice(2, 17).toString('hex')}`);
+
+                // Check if IMEI is in whitelist (approved devices)
+                const device = await getDevice(imei);
+                if (!device || device.approved === false) {
+                    log(`[REJECTED] IMEI not approved: ${imei}`);
+                    const nack = Buffer.from([0x00]);
+                    socket.write(nack);
+                    logSent(clientId, nack, 'LOGIN NACK (0x00 = rejected)');
+                    socket.destroy();
+                    return;
+                }
+
+                deviceIMEI = imei;
+                clearTimeout(authTimeout); // Clear auth timeout on successful login
+                log(`[APPROVED] Device: ${device.plateNumber || device.modemType || imei}`);
 
                 const ack = Buffer.from([0x01]);
                 socket.write(ack);
