@@ -371,18 +371,17 @@ app.get('/devices/:imei/trips', async (req, res) => {
                         currentTrip.avgSpeedMoving = Math.round(speedSum / speedCount * 10) / 10;
                     }
 
-                    // Calculate fuel consumption (only for trips > 2km and > 5 minutes)
+                    // Calculate fuel consumption from GPS (only for trips > 2km and > 5 minutes)
                     const startFuel = tripRecords[0].fuelUsedGps;
                     const endFuel = tripRecords[tripRecords.length - 1].fuelUsedGps;
                     if (startFuel !== undefined && endFuel !== undefined) {
                         const fuelUsedMl = endFuel - startFuel;
 
-                        // Only show fuel data if trip is meaningful (>2km and >5min)
                         if (currentTrip.distanceKm >= 2 && currentTrip.durationMinutes >= 5 && fuelUsedMl > 0) {
                             currentTrip.fuelUsedMl = fuelUsedMl;
                             currentTrip.fuelUsedLiters = Math.round(fuelUsedMl / 10) / 100;
                             currentTrip.fuelPer100km = Math.round((currentTrip.fuelUsedLiters / currentTrip.distanceKm) * 100 * 10) / 10;
-                            currentTrip.fuelEstimated = true; // Flag that this is GPS-estimated, not OBD
+                            currentTrip.fuelFromGps = true; // Flag: GPS-estimated, not OBD real
                         }
                     }
 

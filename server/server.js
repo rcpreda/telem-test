@@ -123,13 +123,22 @@ async function startServer() {
         let deviceVIN = null;
         let deviceType = null;
 
+        // Timeout for unauthenticated connections (15 seconds)
+        const authTimeout = setTimeout(() => {
+            if (!deviceIMEI) {
+                log(`[TIMEOUT] ${clientId} - No IMEI received, closing connection`);
+                socket.destroy();
+            }
+        }, 15000);
+
+        // Only poll for authenticated connections
         const interval = setInterval(() => {
-            if (socket.writable) {
-                log(`[POLL] ${clientId}`);
+            if (socket.writable && deviceIMEI) {
+                log(`[POLL] ${clientId} (${deviceIMEI})`);
             }
         }, DATA_INTERVAL);
 
-        clients.set(clientId, { socket, interval });
+        clients.set(clientId, { socket, interval, authTimeout });
 
         socket.on('data', async buffer => {
             // Log raw received data
@@ -139,6 +148,7 @@ async function startServer() {
             const imei = parseIMEI(buffer);
             if (imei) {
                 deviceIMEI = imei;
+                clearTimeout(authTimeout); // Clear auth timeout on successful login
                 log(`[LOGIN] IMEI: ${imei}`);
                 log(`  Parsed from: length=${buffer.readUInt16BE(0)}, imei_bytes=${buffer.slice(2, 17).toString('hex')}`);
 
@@ -219,12 +229,14 @@ async function startServer() {
 
         socket.on('end', () => {
             log(`=== CONNECTION CLOSED: ${clientId} ===`);
+            clearTimeout(authTimeout);
             clearInterval(interval);
             clients.delete(clientId);
         });
 
         socket.on('error', err => {
             log(`[ERROR] ${clientId}: ${err.message}`);
+            clearTimeout(authTimeout);
             clearInterval(interval);
             clients.delete(clientId);
         });
