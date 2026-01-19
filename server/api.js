@@ -338,6 +338,310 @@ app.get('/devices/:imei/stats', async (req, res) => {
     }
 });
 
+// ============ DRIVER BEHAVIOR ============
+
+/**
+ * Convert unsigned 16-bit to signed (accelerometer values)
+ * FMC003 accelerometer returns mG values as unsigned 16-bit
+ */
+function toSigned16(val) {
+    if (val === undefined || val === null) return null;
+    return val > 32767 ? val - 65536 : val;
+}
+
+/**
+ * Apply median filter to remove noise from accelerometer data
+ * Uses a sliding window of 3 samples
+ */
+function medianFilter(values) {
+    if (values.length < 3) return values;
+    const filtered = [values[0]];
+    for (let i = 1; i < values.length - 1; i++) {
+        const window = [values[i - 1], values[i], values[i + 1]].sort((a, b) => a - b);
+        filtered.push(window[1]); // median
+    }
+    filtered.push(values[values.length - 1]);
+    return filtered;
+}
+
+/**
+ * Calculate driver behavior score for a set of trip records
+ * Based on FMC003 capabilities:
+ * - Accelerometer X/Y/Z (harsh braking/acceleration/cornering)
+ * - Speed (GPS)
+ * - Ignition + Movement (idle detection)
+ *
+ * Returns null if insufficient accelerometer data
+ */
+function calculateDriverBehavior(tripRecords) {
+    // Filter records that have accelerometer data
+    const accelRecords = tripRecords.filter(r =>
+        r.accelerometerX !== undefined &&
+        r.accelerometerY !== undefined
+    );
+
+    // Need minimum 5 records with accelerometer for reliable analysis
+    if (accelRecords.length < 5) {
+        return null;
+    }
+
+    // ============ THRESHOLDS ============
+    // Based on industry standards for fleet management:
+    // - Hard brake/accel: > 0.35g sustained for 200ms+
+    // - Harsh cornering: > 0.3g lateral at speed > 20 km/h
+    // FMC003 reports in mG, so 350 mG = 0.35g
+    const HARD_BRAKE_THRESHOLD = 150;      // mG deviation (negative X = braking)
+    const HARD_ACCEL_THRESHOLD = 200;      // mG deviation (positive X = acceleration)
+    const HARSH_CORNER_THRESHOLD = 150;    // mG lateral deviation
+    const MIN_SPEED_FOR_EVENTS = 10;       // km/h - ignore events below this speed
+    const MIN_SPEED_FOR_CORNERING = 20;    // km/h - cornering needs higher speed
+    const IDLE_THRESHOLD_SECONDS = 300;    // 5 minutes of idle = penalty
+    const EVENT_COOLDOWN_MS = 2000;        // 2 seconds between same event type
+
+    // ============ STEP 1: Calculate baseline from stationary records ============
+    const stationaryRecords = tripRecords.filter(r => {
+        const speed = r.obdVehicleSpeed || r.gps?.speed || 0;
+        return speed < 3 && r.accelerometerX !== undefined && r.accelerometerY !== undefined;
+    });
+
+    let baselineX = 0;
+    let baselineY = 0;
+
+    if (stationaryRecords.length >= 3) {
+        // Use median of stationary records for robust baseline
+        const xValues = stationaryRecords.map(r => toSigned16(r.accelerometerX)).sort((a, b) => a - b);
+        const yValues = stationaryRecords.map(r => toSigned16(r.accelerometerY)).sort((a, b) => a - b);
+        const midIdx = Math.floor(xValues.length / 2);
+        baselineX = xValues[midIdx];
+        baselineY = yValues[midIdx];
+    } else {
+        // Fallback: average of first few readings
+        const firstRecords = accelRecords.slice(0, 5);
+        baselineX = Math.round(firstRecords.reduce((sum, r) => sum + toSigned16(r.accelerometerX), 0) / firstRecords.length);
+        baselineY = Math.round(firstRecords.reduce((sum, r) => sum + toSigned16(r.accelerometerY), 0) / firstRecords.length);
+    }
+
+    // ============ STEP 2: Prepare filtered accelerometer data ============
+    // Extract and convert accelerometer values
+    const xRaw = accelRecords.map(r => toSigned16(r.accelerometerX) - baselineX);
+    const yRaw = accelRecords.map(r => toSigned16(r.accelerometerY) - baselineY);
+
+    // Apply median filter to reduce noise
+    const xFiltered = medianFilter(xRaw);
+    const yFiltered = medianFilter(yRaw);
+
+    // ============ STEP 3: Detect events ============
+    let hardBraking = 0;
+    let hardAcceleration = 0;
+    let harshCornering = 0;
+    let idleSeconds = 0;
+    let maxSpeed = 0;
+    let maxRpm = 0;
+
+    // Cooldown tracking
+    let lastBrakeTime = null;
+    let lastAccelTime = null;
+    let lastCornerTime = null;
+
+    let prevRecord = null;
+
+    for (let i = 0; i < tripRecords.length; i++) {
+        const r = tripRecords[i];
+        const speed = r.obdVehicleSpeed || r.gps?.speed || 0;
+        const rpm = r.obdEngineRpm || 0;
+        const currentTime = new Date(r.timestamp).getTime();
+        const ignition = r.ignition || 0;
+        const movement = r.movement || 0;
+
+        // Track max values
+        if (speed > maxSpeed) maxSpeed = speed;
+        if (rpm > maxRpm) maxRpm = rpm;
+
+        // Calculate time delta
+        let deltaSeconds = 5;
+        if (prevRecord) {
+            const timeDiff = (new Date(r.timestamp) - new Date(prevRecord.timestamp)) / 1000;
+            deltaSeconds = Math.min(Math.max(1, timeDiff), 60); // Cap between 1-60s
+        }
+
+        // ============ IDLE DETECTION ============
+        // Ignition ON + Speed = 0 + not moving
+        if (ignition === 1 && speed < 3 && movement === 0) {
+            idleSeconds += deltaSeconds;
+        }
+
+        // ============ ACCELEROMETER EVENTS ============
+        // Find corresponding filtered accelerometer record
+        const accelIdx = accelRecords.findIndex(ar => ar.timestamp === r.timestamp);
+
+        if (accelIdx >= 0 && speed >= MIN_SPEED_FOR_EVENTS) {
+            const devX = xFiltered[accelIdx];
+            const devY = yFiltered[accelIdx];
+
+            // Hard braking (large negative X)
+            if (devX < -HARD_BRAKE_THRESHOLD) {
+                if (!lastBrakeTime || (currentTime - lastBrakeTime) > EVENT_COOLDOWN_MS) {
+                    hardBraking++;
+                    lastBrakeTime = currentTime;
+                }
+            }
+
+            // Hard acceleration (large positive X)
+            if (devX > HARD_ACCEL_THRESHOLD) {
+                if (!lastAccelTime || (currentTime - lastAccelTime) > EVENT_COOLDOWN_MS) {
+                    hardAcceleration++;
+                    lastAccelTime = currentTime;
+                }
+            }
+
+            // Harsh cornering (large Y deviation at sufficient speed)
+            if (Math.abs(devY) > HARSH_CORNER_THRESHOLD && speed >= MIN_SPEED_FOR_CORNERING) {
+                if (!lastCornerTime || (currentTime - lastCornerTime) > EVENT_COOLDOWN_MS) {
+                    harshCornering++;
+                    lastCornerTime = currentTime;
+                }
+            }
+        }
+
+        prevRecord = r;
+    }
+
+    // ============ STEP 4: Calculate scores ============
+    // Two separate scores:
+    // - driverScore: behavior (braking, acceleration, cornering)
+    // - efficiencyScore: fleet efficiency (idle time)
+
+    // Calculate trip duration
+    const tripStart = new Date(tripRecords[0].timestamp);
+    const tripEnd = new Date(tripRecords[tripRecords.length - 1].timestamp);
+    const tripDurationMinutes = Math.round((tripEnd - tripStart) / 60000);
+
+    // Normalization factor CLAMPED between 1-6 (max normalization = 60 min)
+    // Beyond 1 hour, behavior must count fully
+    const durationFactor = Math.min(6, Math.max(1, tripDurationMinutes / 10));
+
+    // === DRIVER SCORE (behavior only) ===
+    // Raw penalties with CAPS per category
+    const rawPenalties = {
+        hardBraking: Math.min(25, hardBraking * 4),           // Cap 25, -4 per event
+        hardAcceleration: Math.min(20, hardAcceleration * 2), // Cap 20, -2 per event
+        harshCornering: Math.min(15, harshCornering * 3)      // Cap 15, -3 per event
+    };
+
+    const totalRawPenalty = Object.values(rawPenalties).reduce((a, b) => a + b, 0);
+
+    // Severe events = braking + cornering (most dangerous)
+    const severeEvents = hardBraking + harshCornering;
+
+    // Normalized penalty with MINIMUM FLOOR for severe events
+    // Ensures at least 3 points penalty if any severe event occurred
+    const normalizedPenalty = Math.max(
+        totalRawPenalty / durationFactor,
+        severeEvents > 0 ? 3 : 0
+    );
+
+    // Final driver score clamped 0-100
+    const driverScore = Math.max(0, Math.min(100, Math.round(100 - normalizedPenalty)));
+
+    // === EFFICIENCY SCORE (idle time) ===
+    // Separate from driver behavior - this is fleet efficiency metric
+    const idleMinutes = Math.round(idleSeconds / 60);
+    const idlePenalty = Math.min(30, Math.floor(idleMinutes / 5) * 2); // -2 per 5 min idle, cap 30
+    const efficiencyScore = Math.max(0, Math.min(100, 100 - idlePenalty));
+
+    // ============ CONFIDENCE CALCULATION ============
+    // Determines how reliable the score is based on data quality
+    const confidenceReasons = [];
+
+    // Check GNSS quality (from first/last records with GPS)
+    const gpsRecords = tripRecords.filter(r => r.gps?.satellites > 0);
+    const avgSatellites = gpsRecords.length > 0
+        ? gpsRecords.reduce((sum, r) => sum + r.gps.satellites, 0) / gpsRecords.length
+        : 0;
+
+    if (avgSatellites < 3) {
+        confidenceReasons.push('poor_gnss');
+    }
+
+    // Check if we have enough accelerometer data
+    const accelCoverage = accelRecords.length / tripRecords.length;
+    if (accelCoverage < 0.3) {
+        confidenceReasons.push('low_accel_coverage');
+    }
+
+    // Check trip duration (very short trips have less reliable data)
+    if (tripDurationMinutes < 5) {
+        confidenceReasons.push('short_trip');
+    }
+
+    // Check if distance was estimated (odometer didn't update)
+    const startOdo = tripRecords[0]?.totalOdometer;
+    const endOdo = tripRecords[tripRecords.length - 1]?.totalOdometer;
+    if (startOdo && endOdo && startOdo === endOdo) {
+        confidenceReasons.push('distance_estimated');
+    }
+
+    // Determine confidence level
+    // Note: short_trip doesn't affect score, only perfectTrip eligibility
+    const scoreAffectingReasons = confidenceReasons.filter(r => r !== 'short_trip');
+    let confidenceLevel = 'high';
+    if (scoreAffectingReasons.length >= 2) {
+        confidenceLevel = 'low';
+    } else if (scoreAffectingReasons.length === 1) {
+        confidenceLevel = 'medium';
+    }
+
+    // ============ PERFECT TRIP DETERMINATION ============
+    // Perfect trip requires: no penalties + high confidence + minimum duration
+    const perfectTrip = totalRawPenalty === 0 &&
+                        confidenceLevel === 'high' &&
+                        tripDurationMinutes >= 5;
+
+    // Apply confidence damping (low confidence caps score at 95)
+    let finalDriverScore = driverScore;
+    if (confidenceLevel === 'low' && driverScore > 95) {
+        finalDriverScore = 95;
+    }
+
+    return {
+        score: finalDriverScore,  // Main score for backward compatibility
+        driverScore: finalDriverScore,
+        efficiencyScore,
+        perfectTrip,
+        confidence: {
+            level: confidenceLevel,
+            reasons: confidenceReasons,
+            accelCoverage: Math.round(accelCoverage * 100),
+            avgSatellites: Math.round(avgSatellites * 10) / 10
+        },
+        events: {
+            hardBraking,
+            hardAcceleration,
+            harshCornering,
+            idleMinutes
+        },
+        penalties: {
+            raw: rawPenalties,
+            totalRaw: totalRawPenalty,
+            normalized: Math.round(normalizedPenalty * 10) / 10,
+            durationFactor: Math.round(durationFactor * 10) / 10,
+            severeEvents,
+            idlePenalty
+        },
+        maxSpeed,
+        maxRpm,
+        baseline: {
+            x: Math.round(baselineX),
+            y: Math.round(baselineY)
+        },
+        analysis: {
+            recordsWithAccel: accelRecords.length,
+            totalRecords: tripRecords.length,
+            tripDurationMinutes
+        }
+    };
+}
+
 // ============ TRIPS ============
 
 // Get trips (based on ignition on/off)
@@ -478,6 +782,12 @@ app.get('/devices/:imei/trips', async (req, res) => {
                     } else {
                         currentTrip.startPosition = tripRecords[0].gps;
                         currentTrip.endPosition = tripRecords[tripRecords.length - 1].gps;
+                    }
+
+                    // Calculate driver behavior (returns null if insufficient accelerometer data)
+                    const driverBehavior = calculateDriverBehavior(tripRecords);
+                    if (driverBehavior) {
+                        currentTrip.driverBehavior = driverBehavior;
                     }
 
                     // Only add trip if it has meaningful data (duration >= 2 min or distance > 100m)
