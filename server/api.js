@@ -645,6 +645,7 @@ function calculateDriverBehavior(tripRecords) {
 // ============ TRIPS ============
 
 // Get trips (based on ignition on/off)
+// Query params: start, end (ISO dates), limit (max 25), skip (pagination)
 app.get('/devices/:imei/trips', async (req, res) => {
     try {
         const db = getDb();
@@ -655,14 +656,29 @@ app.get('/devices/:imei/trips', async (req, res) => {
         }
 
         const collection = getCollectionName('records', device.modemType);
-        const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+        const limit = Math.min(parseInt(req.query.limit) || 25, 25);  // Max 25 per page
+        const skip = parseInt(req.query.skip) || 0;
 
-        // Get all records (we need all data to calculate stats)
+        // Build query with optional date range
+        const query = {
+            imei: req.params.imei,
+            ignition: { $exists: true }
+        };
+
+        // Add date range filter if provided
+        if (req.query.start || req.query.end) {
+            query.timestamp = {};
+            if (req.query.start) {
+                query.timestamp.$gte = req.query.start;
+            }
+            if (req.query.end) {
+                query.timestamp.$lte = req.query.end;
+            }
+        }
+
+        // Get records (we need all data in range to calculate stats)
         const records = await db.collection(collection)
-            .find({
-                imei: req.params.imei,
-                ignition: { $exists: true }
-            })
+            .find(query)
             .sort({ timestamp: 1 })  // Sort ascending for easier processing
             .toArray();
 
@@ -804,10 +820,17 @@ app.get('/devices/:imei/trips', async (req, res) => {
         // Sort trips by start time descending (most recent first)
         trips.sort((a, b) => new Date(b.startTime) - new Date(a.startTime));
 
+        // Apply pagination
+        const paginatedTrips = trips.slice(skip, skip + limit);
+
         res.json({
             device: req.params.imei,
-            count: Math.min(trips.length, limit),
-            trips: trips.slice(0, limit)
+            total: trips.length,
+            limit,
+            skip,
+            hasMore: skip + limit < trips.length,
+            count: paginatedTrips.length,
+            trips: paginatedTrips
         });
     } catch (err) {
         res.status(500).json({ error: err.message });
